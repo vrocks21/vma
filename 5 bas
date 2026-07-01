@@ -1,0 +1,83 @@
+Attribute VB_Name = "modSourceData"
+Option Explicit
+
+'======================================================================
+' modSourceData
+'----------------------------------------------------------------------
+' Everything that touches the SOURCE workbook: open/reuse it, find the
+' Trade ID column inside a table, and locate the first valid table.
+'======================================================================
+
+'----------------------------------------------------------------------
+' Open the persisted source workbook, or reuse it if already open.
+' Opened read-only so we never risk altering the source data.
+'----------------------------------------------------------------------
+Public Function GetSourceWorkbook() As Workbook
+    Dim sPath As String, sName As String
+    Dim wb As Workbook
+
+    sPath = GetSourcePath()
+    If Len(sPath) = 0 Then
+        Err.Raise vbObjectError + 513, , _
+            "No source workbook selected. Click 'Browse Workbook' first."
+    End If
+    If Dir$(sPath) = vbNullString Then
+        Err.Raise vbObjectError + 514, , _
+            "The selected source file no longer exists:" & vbCrLf & sPath
+    End If
+
+    sName = Mid$(sPath, InStrRev(sPath, "\") + 1)
+
+    ' Reuse if a workbook with this file name is already open.
+    On Error Resume Next
+    Set wb = Application.Workbooks(sName)
+    On Error GoTo 0
+
+    If wb Is Nothing Then
+        On Error GoTo OpenFail
+        Set wb = Application.Workbooks.Open( _
+                    Filename:=sPath, ReadOnly:=True, UpdateLinks:=0)
+        On Error GoTo 0
+    End If
+
+    Set GetSourceWorkbook = wb
+    Exit Function
+
+OpenFail:
+    Err.Raise vbObjectError + 515, , _
+        "The source workbook could not be opened:" & vbCrLf & sPath
+End Function
+
+'----------------------------------------------------------------------
+' Return the 1-based column index of headerText inside a ListObject,
+' or 0 if that table does not contain the column. (Whole, case-insens.)
+'----------------------------------------------------------------------
+Public Function TableColumnIndex(ByVal lo As ListObject, _
+                                 ByVal headerText As String) As Long
+    Dim i As Long
+    For i = 1 To lo.ListColumns.Count
+        If StrComp(Trim$(CStr(lo.ListColumns(i).Name)), _
+                   headerText, vbTextCompare) = 0 Then
+            TableColumnIndex = i
+            Exit Function
+        End If
+    Next i
+    TableColumnIndex = 0
+End Function
+
+'----------------------------------------------------------------------
+' Find the FIRST table in the workbook that contains the source Trade ID
+' column. Used to establish the output headers on the first run.
+'----------------------------------------------------------------------
+Public Function FindFirstTradeTable(ByVal wb As Workbook) As ListObject
+    Dim ws As Worksheet, lo As ListObject
+    For Each ws In wb.Worksheets
+        For Each lo In ws.ListObjects
+            If TableColumnIndex(lo, HEADER_SOURCE_ID) > 0 Then
+                Set FindFirstTradeTable = lo
+                Exit Function
+            End If
+        Next lo
+    Next ws
+    Set FindFirstTradeTable = Nothing
+End Function
