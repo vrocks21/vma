@@ -2,10 +2,12 @@ Attribute VB_Name = "modSourceData"
 Option Explicit
 
 '======================================================================
-' modSourceData
+' modSourceData  (RANGE-BASED version)
 '----------------------------------------------------------------------
-' Everything that touches the SOURCE workbook: open/reuse it, find the
-' Trade ID column inside a table, and locate the first valid table.
+' Works with plain formatted ranges (NOT Excel Tables). A "table" is
+' detected as the CurrentRegion around a cell that exactly equals the
+' Barclays Trade ID header - i.e. the contiguous block bounded by blank
+' rows and columns. Multiple blocks per sheet are supported.
 '======================================================================
 
 '----------------------------------------------------------------------
@@ -28,7 +30,6 @@ Public Function GetSourceWorkbook() As Workbook
 
     sName = Mid$(sPath, InStrRev(sPath, "\") + 1)
 
-    ' Reuse if a workbook with this file name is already open.
     On Error Resume Next
     Set wb = Application.Workbooks(sName)
     On Error GoTo 0
@@ -49,35 +50,63 @@ OpenFail:
 End Function
 
 '----------------------------------------------------------------------
-' Return the 1-based column index of headerText inside a ListObject,
-' or 0 if that table does not contain the column. (Whole, case-insens.)
+' Return a Collection of every cell on ws whose value EXACTLY equals
+' headerText (whole-cell, case-insensitive). Each such cell anchors one
+' data block. Empty collection if none.
 '----------------------------------------------------------------------
-Public Function TableColumnIndex(ByVal lo As ListObject, _
-                                 ByVal headerText As String) As Long
-    Dim i As Long
-    For i = 1 To lo.ListColumns.Count
-        If StrComp(Trim$(CStr(lo.ListColumns(i).Name)), _
-                   headerText, vbTextCompare) = 0 Then
-            TableColumnIndex = i
-            Exit Function
-        End If
-    Next i
-    TableColumnIndex = 0
+Public Function FindAllHeaderCells(ByVal ws As Worksheet, _
+                                   ByVal headerText As String) As Collection
+    Dim result As Collection
+    Dim f As Range, firstAddr As String
+    Set result = New Collection
+
+    Set f = ws.Cells.Find(What:=headerText, _
+                          LookIn:=xlValues, _
+                          LookAt:=xlWhole, _
+                          SearchOrder:=xlByRows, _
+                          MatchCase:=False)
+    If Not f Is Nothing Then
+        firstAddr = f.Address
+        Do
+            result.Add f
+            Set f = ws.Cells.FindNext(f)
+            If f Is Nothing Then Exit Do
+        Loop While f.Address <> firstAddr
+    End If
+
+    Set FindAllHeaderCells = result
 End Function
 
 '----------------------------------------------------------------------
-' Find the FIRST table in the workbook that contains the source Trade ID
-' column. Used to establish the output headers on the first run.
+' First block anywhere in the workbook that has the source Trade ID
+' header. Used to establish output headers on the first run.
 '----------------------------------------------------------------------
-Public Function FindFirstTradeTable(ByVal wb As Workbook) As ListObject
-    Dim ws As Worksheet, lo As ListObject
+Public Function FindFirstSourceHeaderCell(ByVal wb As Workbook) As Range
+    Dim ws As Worksheet, hcs As Collection
     For Each ws In wb.Worksheets
-        For Each lo In ws.ListObjects
-            If TableColumnIndex(lo, HEADER_SOURCE_ID) > 0 Then
-                Set FindFirstTradeTable = lo
-                Exit Function
-            End If
-        Next lo
+        Set hcs = FindAllHeaderCells(ws, HEADER_SOURCE_ID)
+        If hcs.Count > 0 Then
+            Set FindFirstSourceHeaderCell = hcs(1)
+            Exit Function
+        End If
     Next ws
-    Set FindFirstTradeTable = Nothing
+    Set FindFirstSourceHeaderCell = Nothing
 End Function
+
+'----------------------------------------------------------------------
+' Given a header cell, derive its rectangular block from CurrentRegion.
+' Returns the header row, the left/right columns, and the last data row.
+' (The block is bounded by surrounding blank rows/columns.)
+'----------------------------------------------------------------------
+Public Sub GetBlockBounds(ByVal headerCell As Range, _
+                          ByRef hdrRow As Long, _
+                          ByRef firstCol As Long, _
+                          ByRef lastCol As Long, _
+                          ByRef lastRow As Long)
+    Dim blk As Range
+    Set blk = headerCell.CurrentRegion
+    hdrRow = headerCell.Row
+    firstCol = blk.Column
+    lastCol = blk.Column + blk.Columns.Count - 1
+    lastRow = blk.Row + blk.Rows.Count - 1
+End Sub
