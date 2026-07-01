@@ -1,0 +1,65 @@
+Attribute VB_Name = "modPerf"
+Option Explicit
+
+'======================================================================
+' modPerf
+'----------------------------------------------------------------------
+' Saves and restores Excel application settings so macros run fast and
+' the environment is ALWAYS restored - even if an error occurs mid-run.
+'   FastModeOn  -> snapshot current settings, then disable the slow ones.
+'   FastModeOff -> restore the exact snapshot (safe to call any time).
+'======================================================================
+
+Private Type TAppState
+    ScreenUpdating As Boolean
+    EnableEvents   As Boolean
+    DisplayAlerts  As Boolean
+    Calculation    As XlCalculation
+    StatusBar      As Variant
+    Captured       As Boolean
+End Type
+
+Private mState As TAppState
+
+'----------------------------------------------------------------------
+' Enter high-performance mode (snapshot taken only on the first call).
+'----------------------------------------------------------------------
+Public Sub FastModeOn()
+    With Application
+        If Not mState.Captured Then
+            mState.ScreenUpdating = .ScreenUpdating
+            mState.EnableEvents = .EnableEvents
+            mState.DisplayAlerts = .DisplayAlerts
+            mState.Calculation = .Calculation
+            mState.StatusBar = .StatusBar
+            mState.Captured = True
+        End If
+        .ScreenUpdating = False
+        .EnableEvents = False
+        .DisplayAlerts = False
+        .Calculation = xlCalculationManual
+    End With
+End Sub
+
+'----------------------------------------------------------------------
+' Restore the captured settings. If nothing was captured (e.g. an early
+' failure), fall back to sensible defaults so Excel is never left frozen.
+'----------------------------------------------------------------------
+Public Sub FastModeOff()
+    With Application
+        If mState.Captured Then
+            .ScreenUpdating = mState.ScreenUpdating
+            .EnableEvents = mState.EnableEvents
+            .DisplayAlerts = mState.DisplayAlerts
+            .Calculation = mState.Calculation
+            .StatusBar = mState.StatusBar
+            mState.Captured = False
+        Else
+            .ScreenUpdating = True
+            .EnableEvents = True
+            .DisplayAlerts = True
+            .Calculation = xlCalculationAutomatic
+            .StatusBar = False
+        End If
+    End With
+End Sub
