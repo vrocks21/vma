@@ -1,0 +1,336 @@
+Attribute VB_Name = "modController"
+Option Explicit
+
+'======================================================================
+' modController
+'----------------------------------------------------------------------
+' The three public macros assigned to buttons:
+'   BrowseSourceWorkbook  -> pick the source file
+'   ExtractTrades         -> the main lookup engine
+'   ResetSheet            -> clear inputs + outputs, keep everything else
+'
+' Plus private helpers that drive the engine.
+'======================================================================
+
+
+'======================================================================
+' BUTTON 1: Browse Workbook
+'----------------------------------------------------------------------
+' Open a file picker (Excel files only) and remember the chosen path.
+'======================================================================
+Public Sub BrowseSourceWorkbook()
+    Dim fd As FileDialog
+    Dim sPath As String
+
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .Title = "Select the SOURCE workbook containing the trade tables"
+        .AllowMultiSelect = False
+        .Filters.Clear
+        .Filters.Add "Excel Workbooks", "*.xlsx; *.xlsm; *.xlsb; *.xls"
+        If .Show <> -1 Then Exit Sub          ' user cancelled
+        sPath = .SelectedItems(1)
+    End With
+
+    SetSourcePath sPath
+    MsgBox "Source workbook set to:" & vbCrLf & vbCrLf & sPath, _
+           vbInformation, "Vinzor Trade Lookup"
+End Sub
+
+
+'======================================================================
+' BUTTON 2: Extract Trades
+'----------------------------------------------------------------------
+' Reads every Trade ID under the "Trade ID" header on the ACTIVE sheet,
+' looks each one up in the source workbook's tables (in memory, via
+' arrays), and writes the matching columns immediately to the right.
+'======================================================================
+Public Sub ExtractTrades()
+    Dim ws As Worksheet
+    Dim hdrCell As Range
+    Dim hdrRow As Long, idCol As Long, outStartCol As Long
+    Dim firstRow As Long, lastRow As Long, nRows As Long
+    Dim arrIDs As Variant
+    Dim dictRows As Object        ' id -> Collection of local row indexes
+    Dim dictPending As Object     ' id still to find -> True
+    Dim outHdrMap As Object       ' output header name -> local out column
+    Dim nOut As Long
+    Dim outArr() As Variant
+    Dim src As Workbook
+    Dim i As Long
+    Dim sid As String
+    Dim coll As Collection
+
+    On Error GoTo CleanFail
+
+    Set ws = ActiveSheet
+
+    ' --- 1. Locate the Trade ID input header on the ACTIVE sheet only ---
+    Set hdrCell = FindHeaderCell(ws, HEADER_TRADE_ID)
+    If hdrCell Is Nothing Then
+        Err.Raise vbObjectError + 520, , _
+            "Header '" & HEADER_TRADE_ID & "' was not found on the active sheet."
+    End If
+    hdrRow = hdrCell.Row
+    idCol = hdrCell.Column
+    outStartCol = idCol + 1
+
+    ' --- 2. Read every Trade ID below the header (blanks skipped later) -
+    lastRow = ws.Cells(ws.Rows.Count, idCol).End(xlUp).Row
+    If lastRow <= hdrRow Then
+        Err.Raise vbObjectError + 521, , _
+            "No Trade IDs were entered below the '" & HEADER_TRADE_ID & "' header."
+    End If
+    firstRow = hdrRow + 1
+    nRows = lastRow - firstRow + 1
+    arrIDs = ToArray2D(ws.Range(ws.Cells(firstRow, idCol), _
+                                ws.Cells(lastRow, idCol)).Value)
+
+    ' --- 3. Build lookup dictionaries (duplicates fully supported) ------
+    Set dictRows = CreateObject("Scripting.Dictionary")
+    Set dictPending = CreateObject("Scripting.Dictionary")
+    For i = 1 To nRows
+        sid = NormID(arrIDs(i, 1))
+        If Len(sid) > 0 Then
+            If Not dictRows.Exists(sid) Then
+                Set coll = New Collection
+                dictRows.Add sid, coll
+                dictPending(sid) = True
+            End If
+            dictRows(sid).Add i        ' local index within the output block
+        End If
+    Next i
+    If dictRows.Count = 0 Then
+        Err.Raise vbObjectError + 521, , _
+            "No non-blank Trade IDs were found below the header."
+    End If
+
+    FastModeOn
+
+    ' --- 4. Open / reuse the source workbook ---------------------------
+    Set src = GetSourceWorkbook()
+
+    ' --- 5. Detect existing output headers, or establish them once -----
+    Set outHdrMap = BuildOutputHeaders(ws, hdrRow, outStartCol, src)
+    nOut = outHdrMap.Count
+    If nOut = 0 Then
+        Err.Raise vbObjectError + 522, , _
+            "Could not determine any output columns from the source tables."
+    End If
+
+    ' --- 6. In-memory output block (blank cells stay blank) ------------
+    ReDim outArr(1 To nRows, 1 To nOut)
+
+    ' --- 7. Scan source tables, fill the array, early-exit when done ----
+    ScanSource src, dictRows, dictPending, outHdrMap, outArr
+
+    ' --- 8. One bulk write of the whole results block ------------------
+    ws.Range(ws.Cells(firstRow, outStartCol), _
+             ws.Cells(lastRow, outStartCol + nOut - 1)).Value = outArr
+
+    FastModeOff
+
+    ' --- 9. Report any Trade IDs that were not located -----------------
+    If dictPending.Count > 0 Then
+        MsgBox "Extraction complete." & vbCrLf & vbCrLf & _
+               dictPending.Count & " Trade ID(s) were NOT found:" & vbCrLf & _
+               JoinKeys(dictPending, ", ", 25), _
+               vbExclamation, "Vinzor Trade Lookup"
+    Else
+        MsgBox "Extraction complete. All Trade IDs were found.", _
+               vbInformation, "Vinzor Trade Lookup"
+    End If
+    Exit Sub
+
+CleanFail:
+    FastModeOff
+    MsgBox "Extraction stopped:" & vbCrLf & vbCrLf & Err.Description, _
+           vbCritical, "Vinzor Trade Lookup"
+End Sub
+
+
+'======================================================================
+' BUTTON 3: Reset Sheet
+'----------------------------------------------------------------------
+' Clears the entered Trade IDs and all extracted values, while keeping
+' the Trade ID header, output headers, formatting, column widths,
+' formulas and buttons intact.
+'======================================================================
+Public Sub ResetSheet()
+    Dim ws As Worksheet, hdrCell As Range
+    Dim hdrRow As Long, idCol As Long, outStartCol As Long
+    Dim lastOutCol As Long, lastRow As Long, c As Long, rr As Long
+
+    On Error GoTo CleanFail
+    Set ws = ActiveSheet
+
+    Set hdrCell = FindHeaderCell(ws, HEADER_TRADE_ID)
+    If hdrCell Is Nothing Then
+        Err.Raise vbObjectError + 520, , _
+            "Header '" & HEADER_TRADE_ID & "' was not found on the active sheet."
+    End If
+    hdrRow = hdrCell.Row
+    idCol = hdrCell.Column
+    outStartCol = idCol + 1
+
+    ' Right-most output header in the contiguous block (idCol if none).
+    lastOutCol = idCol
+    c = outStartCol
+    Do While Len(Trim$(CStr(ws.Cells(hdrRow, c).Value))) > 0
+        lastOutCol = c
+        c = c + 1
+    Loop
+
+    ' Last used row across the ID + output columns.
+    lastRow = ws.Cells(ws.Rows.Count, idCol).End(xlUp).Row
+    For c = outStartCol To lastOutCol
+        rr = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+        If rr > lastRow Then lastRow = rr
+    Next c
+
+    If lastRow > hdrRow Then
+        FastModeOn
+        ' Clear CONSTANTS only -> wipes typed IDs and extracted values
+        ' but preserves any user formulas in the data area.
+        On Error Resume Next
+        ws.Range(ws.Cells(hdrRow + 1, idCol), _
+                 ws.Cells(lastRow, lastOutCol)) _
+                 .SpecialCells(xlCellTypeConstants).ClearContents
+        On Error GoTo CleanFail
+        FastModeOff
+    End If
+
+    MsgBox "Sheet reset. Headers preserved; ready for the next batch.", _
+           vbInformation, "Vinzor Trade Lookup"
+    Exit Sub
+
+CleanFail:
+    FastModeOff
+    MsgBox "Reset stopped:" & vbCrLf & vbCrLf & Err.Description, _
+           vbCritical, "Vinzor Trade Lookup"
+End Sub
+
+
+'======================================================================
+' PRIVATE HELPERS
+'======================================================================
+
+'----------------------------------------------------------------------
+' Return a map of output-header-name -> local output column (1-based).
+' If headers already exist to the right of the Trade ID header, reuse
+' them. Otherwise establish them from the first valid source table and
+' write them to the sheet.
+'----------------------------------------------------------------------
+Private Function BuildOutputHeaders(ByVal ws As Worksheet, _
+                                    ByVal hdrRow As Long, _
+                                    ByVal outStartCol As Long, _
+                                    ByVal src As Workbook) As Object
+    Dim map As Object
+    Dim c As Long, nm As String
+    Set map = CreateObject("Scripting.Dictionary")
+    map.CompareMode = vbTextCompare        ' case-insensitive name match
+
+    ' --- Reuse existing output headers (contiguous, to the right) ------
+    c = outStartCol
+    Do While Len(Trim$(CStr(ws.Cells(hdrRow, c).Value))) > 0
+        nm = Trim$(CStr(ws.Cells(hdrRow, c).Value))
+        If Not map.Exists(nm) Then map.Add nm, (c - outStartCol + 1)
+        c = c + 1
+    Loop
+    If map.Count > 0 Then
+        Set BuildOutputHeaders = map
+        Exit Function
+    End If
+
+    ' --- Establish headers from the FIRST valid source table ----------
+    Dim lo As ListObject
+    Set lo = FindFirstTradeTable(src)
+    If lo Is Nothing Then
+        Err.Raise vbObjectError + 523, , _
+            "No table containing the '" & HEADER_SOURCE_ID & _
+            "' column was found in the source workbook."
+    End If
+
+    Dim hdr As Variant, i As Long, localCol As Long
+    hdr = ToArray2D(lo.HeaderRowRange.Value)     ' 1 x nCols
+    localCol = 0
+    For i = 1 To UBound(hdr, 2)
+        nm = Trim$(CStr(hdr(1, i)))
+        ' Skip the Trade ID column itself and any blank header.
+        If Len(nm) > 0 And _
+           StrComp(nm, HEADER_SOURCE_ID, vbTextCompare) <> 0 Then
+            localCol = localCol + 1
+            ws.Cells(hdrRow, outStartCol + localCol - 1).Value = nm
+            If Not map.Exists(nm) Then map.Add nm, localCol
+        End If
+    Next i
+
+    Set BuildOutputHeaders = map
+End Function
+
+'----------------------------------------------------------------------
+' Walk every worksheet -> every ListObject in the source. For each table
+' that contains the Barclays Trade ID column, read its whole body into an
+' array ONCE and match rows against the pending IDs. Columns are mapped
+' by HEADER NAME, so data lands correctly even if table column order
+' differs. Stops as soon as every requested ID has been found.
+'----------------------------------------------------------------------
+Private Sub ScanSource(ByVal src As Workbook, _
+                       ByVal dictRows As Object, _
+                       ByVal dictPending As Object, _
+                       ByVal outHdrMap As Object, _
+                       ByRef outArr As Variant)
+    Dim ws As Worksheet, lo As ListObject
+    Dim idCol As Long
+    Dim hdr As Variant, body As Variant
+    Dim srcCols() As Long, outCols() As Long, nMap As Long
+    Dim i As Long, r As Long, k As Long
+    Dim sid As String, nm As String
+    Dim occ As Variant
+
+    For Each ws In src.Worksheets
+        For Each lo In ws.ListObjects
+
+            idCol = TableColumnIndex(lo, HEADER_SOURCE_ID)
+            If idCol = 0 Then GoTo NextTable          ' table not relevant
+            If lo.DataBodyRange Is Nothing Then GoTo NextTable  ' empty table
+
+            ' Build this table's column map (source col -> output col),
+            ' skipping the Trade ID column and any unknown headers.
+            hdr = ToArray2D(lo.HeaderRowRange.Value)
+            ReDim srcCols(1 To UBound(hdr, 2))
+            ReDim outCols(1 To UBound(hdr, 2))
+            nMap = 0
+            For i = 1 To UBound(hdr, 2)
+                If i <> idCol Then
+                    nm = Trim$(CStr(hdr(1, i)))
+                    If outHdrMap.Exists(nm) Then
+                        nMap = nMap + 1
+                        srcCols(nMap) = i
+                        outCols(nMap) = outHdrMap(nm)
+                    End If
+                End If
+            Next i
+
+            ' One bulk read of the entire table body.
+            body = ToArray2D(lo.DataBodyRange.Value)
+
+            For r = 1 To UBound(body, 1)
+                sid = NormID(body(r, idCol))
+                If Len(sid) > 0 Then
+                    If dictPending.Exists(sid) Then
+                        ' Populate EVERY occurrence of this ID at once.
+                        For Each occ In dictRows(sid)
+                            For k = 1 To nMap
+                                outArr(occ, outCols(k)) = body(r, srcCols(k))
+                            Next k
+                        Next occ
+                        dictPending.Remove sid
+                        If dictPending.Count = 0 Then Exit Sub  ' all done
+                    End If
+                End If
+            Next r
+NextTable:
+        Next lo
+    Next ws
+End Sub
