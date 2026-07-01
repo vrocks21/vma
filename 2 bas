@@ -1,0 +1,47 @@
+Attribute VB_Name = "modConfig"
+Option Explicit
+
+'======================================================================
+' modConfig
+'----------------------------------------------------------------------
+' Central configuration for the Trade Lookup tool.
+'  - All header text lives here (single place to change it).
+'  - The chosen source workbook path is persisted on THIS workbook
+'    (as a custom document property) so Browse and Extract can be run
+'    independently and the choice survives across macro runs.
+'======================================================================
+
+' Header the USER types in the working sheet (input column).
+Public Const HEADER_TRADE_ID  As String = "Trade ID"
+
+' Header that identifies the Trade ID column inside the SOURCE tables.
+Public Const HEADER_SOURCE_ID As String = "Barclays Trade ID"
+
+' Name of the custom document property that stores the source file path.
+Private Const NAME_SOURCE_PATH As String = "VinzorSourcePath"
+
+
+'----------------------------------------------------------------------
+' Persist the selected source workbook full path on this workbook.
+'----------------------------------------------------------------------
+Public Sub SetSourcePath(ByVal sPath As String)
+    On Error Resume Next
+    ThisWorkbook.CustomDocumentProperties(NAME_SOURCE_PATH).Delete
+    On Error GoTo 0
+    ThisWorkbook.CustomDocumentProperties.Add _
+        Name:=NAME_SOURCE_PATH, _
+        LinkToContent:=False, _
+        Type:=msoPropertyTypeString, _
+        Value:=sPath
+End Sub
+
+'----------------------------------------------------------------------
+' Retrieve the persisted source workbook path (empty if never set).
+'----------------------------------------------------------------------
+Public Function GetSourcePath() As String
+    Dim s As String
+    On Error Resume Next
+    s = ThisWorkbook.CustomDocumentProperties(NAME_SOURCE_PATH).Value
+    On Error GoTo 0
+    GetSourcePath = s
+End Function
