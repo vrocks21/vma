@@ -1,0 +1,81 @@
+Attribute VB_Name = "modHelpers"
+Option Explicit
+
+'======================================================================
+' modHelpers
+'----------------------------------------------------------------------
+' Small, reusable helpers used by the controller and source modules.
+'======================================================================
+
+'----------------------------------------------------------------------
+' Find the single cell on a sheet whose value is EXACTLY headerText
+' (whole-cell match, case-insensitive). Returns Nothing if not present.
+' xlWhole guarantees "Trade ID" will NOT match "Barclays Trade ID".
+'----------------------------------------------------------------------
+Public Function FindHeaderCell(ByVal ws As Worksheet, _
+                               ByVal headerText As String) As Range
+    Dim f As Range
+    On Error Resume Next
+    Set f = ws.Cells.Find(What:=headerText, _
+                          LookIn:=xlValues, _
+                          LookAt:=xlWhole, _
+                          SearchOrder:=xlByRows, _
+                          MatchCase:=False)
+    On Error GoTo 0
+    Set FindHeaderCell = f
+End Function
+
+'----------------------------------------------------------------------
+' Normalise a cell value into a comparable Trade ID string.
+'  - Integer-like numbers are formatted without decimals / scientific
+'    notation so 12345 always equals "12345" whether typed or numeric.
+'----------------------------------------------------------------------
+Public Function NormID(ByVal v As Variant) As String
+    If IsError(v) Then
+        NormID = vbNullString
+    ElseIf IsNull(v) Then
+        NormID = vbNullString
+    ElseIf IsNumeric(v) Then
+        Dim d As Double
+        d = CDbl(v)
+        If d = Int(d) And Abs(d) < 1E+15 Then
+            NormID = Trim$(Format$(d, "0"))
+        Else
+            NormID = Trim$(CStr(v))
+        End If
+    Else
+        NormID = Trim$(CStr(v))
+    End If
+End Function
+
+'----------------------------------------------------------------------
+' Guarantee a Range.Value result is always a 1-based 2D array, even when
+' the range was a single cell (which otherwise returns a scalar).
+'----------------------------------------------------------------------
+Public Function ToArray2D(ByVal v As Variant) As Variant
+    Dim a() As Variant
+    If IsArray(v) Then
+        ToArray2D = v
+    Else
+        ReDim a(1 To 1, 1 To 1)
+        a(1, 1) = v
+        ToArray2D = a
+    End If
+End Function
+
+'----------------------------------------------------------------------
+' Join up to 'cap' dictionary keys into a readable string for messages.
+'----------------------------------------------------------------------
+Public Function JoinKeys(ByVal d As Object, ByVal sep As String, _
+                         ByVal cap As Long) As String
+    Dim k As Variant, s As String, n As Long
+    For Each k In d.Keys
+        n = n + 1
+        If n > cap Then
+            s = s & sep & "...(" & (d.Count - cap) & " more)"
+            Exit For
+        End If
+        If Len(s) = 0 Then s = CStr(k) Else s = s & sep & CStr(k)
+    Next k
+    JoinKeys = s
+End Function
