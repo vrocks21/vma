@@ -1,0 +1,226 @@
+# Vinzor Trade Lookup — Implementation Guide
+
+A button-driven Excel tool that searches multiple Trade IDs across an unknown
+source workbook (any sheets, any tables) and pulls each trade's row in next to
+your input. Nothing is hardcoded. Built for repeated, high-volume use.
+
+---
+
+## 1. Project structure
+
+```
+Vinzor_TradeLookup/
+├── modConfig.bas        Header text + persisted source path
+├── modPerf.bas          Save/restore Excel settings (fast mode)
+├── modHelpers.bas       Generic helpers (find header, normalise, arrays)
+├── modSourceData.bas    Open/reuse source wb, locate tables/columns
+├── modController.bas     The 3 button macros + the lookup engine
+└── ThisWorkbook_code.txt Paste-only safety code for the ThisWorkbook object
+```
+
+Five standard modules (imported) + one ThisWorkbook snippet (pasted).
+No class modules and no UserForm are required — the native file picker
+(`Application.FileDialog`) replaces a custom form.
+
+## 2. Required worksheets
+
+Exactly **one** working sheet that you operate in. The tool always acts on the
+**active sheet** and never touches other sheets in this workbook. You may name
+it anything (e.g. `Lookup`). No hidden/config sheets are needed — the source
+path is stored as a custom document property on the workbook itself.
+
+## 3. Exact workbook layout (the working sheet)
+
+Place a single header cell containing exactly **`Trade ID`** anywhere you like.
+Type Trade IDs underneath it. Outputs appear automatically to the right.
+
+```
+        F            G          H          I        J        K
+1   (title/notes, optional — ignored)
+3                 Trade ID   <- output headers auto-fill here on first run ->
+4                 TR-1001
+5                 TR-1002
+6                 TR-1001    (duplicates allowed — searched once, filled twice)
+```
+
+The header may sit in any row/column. The macro finds it dynamically and
+begins output in the column immediately to its right.
+
+## 4. Where each button goes
+
+Put three Form Control buttons anywhere convenient (e.g. a row above the
+header, or off to the side). Buttons are never overwritten by the macros.
+
+| Button label      | Suggested position |
+|-------------------|--------------------|
+| Browse Workbook   | top of the sheet   |
+| Extract Trades    | next to Browse     |
+| Reset Sheet       | next to Extract    |
+
+## 5. Which macro each button calls
+
+| Button          | Assigned macro          |
+|-----------------|-------------------------|
+| Browse Workbook | `BrowseSourceWorkbook`  |
+| Extract Trades  | `ExtractTrades`         |
+| Reset Sheet     | `ResetSheet`            |
+
+## 6–11. Modules / code
+
+- **Standard modules (6, 7):** the five `.bas` files above — import all five.
+- **Class modules (8):** none required.
+- **ThisWorkbook (9):** paste `ThisWorkbook_code.txt`.
+- **Worksheet code (10):** none required.
+- **UserForm (11):** none required.
+
+## 12–13. References / Microsoft libraries
+
+**None are strictly required.** The dictionaries use late binding
+(`CreateObject("Scripting.Dictionary")`), and `FileDialog` /
+`CustomDocumentProperties` are part of the Office object model that is always
+available.
+
+Optional (for IntelliSense / slightly faster early binding) you may tick
+**Tools ▸ References ▸ Microsoft Scripting Runtime**. Not needed for the tool
+to run.
+
+## 14. Complete VBA code
+
+All code is in the five `.bas` files plus `ThisWorkbook_code.txt`. Nothing is
+abbreviated or stubbed.
+
+## 15. What every procedure does
+
+**modConfig**
+- `SetSourcePath` / `GetSourcePath` — persist & read the chosen source file path
+  on the workbook (survives across runs).
+
+**modPerf**
+- `FastModeOn` — snapshot Excel settings, then disable ScreenUpdating, Events,
+  Alerts and switch Calculation to manual.
+- `FastModeOff` — restore the snapshot exactly (or safe defaults on early fail).
+
+**modHelpers**
+- `FindHeaderCell` — whole-cell, case-insensitive search for a header on a sheet.
+- `NormID` — turn any cell value into a consistent Trade ID string (integers
+  never become scientific notation).
+- `ToArray2D` — guarantee a `.Value` result is always a 1-based 2D array.
+- `JoinKeys` — format up to N dictionary keys for a message box.
+
+**modSourceData**
+- `GetSourceWorkbook` — open the source read-only, or reuse it if already open.
+- `TableColumnIndex` — find a named column inside a table (0 if absent).
+- `FindFirstTradeTable` — first table anywhere that has the Barclays Trade ID col.
+
+**modController**
+- `BrowseSourceWorkbook` — file picker (Excel only); stores the path.
+- `ExtractTrades` — the engine (see flow below).
+- `ResetSheet` — clear inputs + outputs, keep headers/format/formulas/buttons.
+- `BuildOutputHeaders` *(private)* — reuse existing output headers, else create
+  them from the first valid table; returns a name→column map.
+- `ScanSource` *(private)* — read each relevant table's body into an array once,
+  match rows by ID, fill every occurrence, exit early once all are found.
+
+**Extract flow:** find `Trade ID` header → read IDs into dictionaries
+(duplicates → one search, many fills) → open source → establish/detect output
+headers → scan tables in memory (arrays only) with early exit → one bulk write →
+report any not-found IDs.
+
+## 16. Assigning macros to buttons
+
+1. **Developer ▸ Insert ▸ Button (Form Control)** and draw it on the sheet.
+2. In the *Assign Macro* dialog, pick the matching macro from the table in §5.
+3. Right-click the button ▸ *Edit Text* to label it.
+4. Repeat for all three buttons.
+
+(Enable the Developer tab via **File ▸ Options ▸ Customize Ribbon ▸ Developer**.)
+
+## 17. Saving as .xlsm
+
+**File ▸ Save As ▸ Excel Macro-Enabled Workbook (\*.xlsm)**. Saving as plain
+`.xlsx` will silently strip all VBA.
+
+### One-time setup checklist
+1. Open a new workbook → **Alt+F11** (VBA editor).
+2. **File ▸ Import File…** and import all five `.bas` modules.
+3. Double-click **ThisWorkbook**, paste the contents of `ThisWorkbook_code.txt`.
+4. Back in Excel, add the three buttons and assign macros (§16).
+5. Add a `Trade ID` header cell on your working sheet.
+6. Save as `.xlsm`.
+
+## 18. Testing procedure
+
+1. Create a test source workbook: two sheets, two differently-named tables,
+   each with a **`Barclays Trade ID`** column placed in a *non-first* position,
+   plus a few other columns. Put unique IDs across both tables. Save & close.
+2. In the tool, click **Browse Workbook** and select that file.
+3. Type a few IDs under `Trade ID`, including one **duplicate** and one
+   **non-existent** ID.
+4. Click **Extract Trades**.
+   - First run: output headers appear; rows fill in; duplicate row fills too;
+     a message lists the bogus ID as not found.
+5. Click **Extract Trades** again — headers are **not** recreated/overwritten.
+6. Click **Reset Sheet** — IDs and outputs clear; headers, widths, buttons stay.
+
+## 19. Sample input
+
+Source table `tblFXSpot` on sheet `Desk1`:
+
+| Counterparty | Barclays Trade ID | Currency | Book   | Amount  | Maturity   |
+|--------------|-------------------|----------|--------|---------|------------|
+| Acme Bank    | TR-1001           | USD      | LON-FX | 5000000 | 2026-09-30 |
+| Globex       | TR-1002           | EUR      | LON-FX | 3000000 | 2026-12-31 |
+
+Working sheet input:
+
+| Trade ID |
+|----------|
+| TR-1001  |
+| TR-1002  |
+| TR-1001  |
+
+## 20. Expected output
+
+| Trade ID | Counterparty | Currency | Book   | Amount  | Maturity   |
+|----------|--------------|----------|--------|---------|------------|
+| TR-1001  | Acme Bank    | USD      | LON-FX | 5000000 | 2026-09-30 |
+| TR-1002  | Globex       | EUR      | LON-FX | 3000000 | 2026-12-31 |
+| TR-1001  | Acme Bank    | USD      | LON-FX | 5000000 | 2026-09-30 |
+
+Note: `Barclays Trade ID` is **not** copied — your `Trade ID` column already is
+the key. Output column order follows the first table's headers.
+
+## 21. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| "Header 'Trade ID' was not found" | The header cell text isn't exactly `Trade ID` (extra space, typo). |
+| "No source workbook selected" | Click **Browse Workbook** first. |
+| "source file no longer exists" | It was moved/renamed — browse again. |
+| "No table containing 'Barclays Trade ID'" | Source columns must be inside real Excel **Tables** (Ctrl+T) with that exact header. |
+| Some IDs show as not found | ID truly absent, or formatting mismatch (leading apostrophe, spaces). `NormID` trims and de-scientifics integers; clean stray spaces. |
+| Headers got created in the wrong place | Output starts one column right of the `Trade ID` header — ensure that column is clear before the first run. |
+| Wrong file reused | Two open files share a base name; close the unintended one. |
+| Excel feels frozen after an error | Re-run any macro (it calls `FastModeOff`), or just reopen the workbook (Workbook_Open restores settings). |
+
+## 22. Why it's fast
+
+- **Arrays, not cells:** each table body is read once with a single
+  `.Value` call; matching happens in memory — no cell-by-cell looping.
+- **Dictionaries:** O(1) ID lookups; duplicates are searched once and filled
+  for every occurrence.
+- **Early exit:** uniqueness across the workbook means the scan stops the
+  instant the last pending ID is found.
+- **Bulk write:** all results land in one array-to-range assignment.
+- **No Select/Activate/Copy-Paste;** ScreenUpdating/Events/Calc disabled during
+  the run and always restored.
+
+## 23. Future enhancements (easy to add)
+
+- Extra status column flagging FOUND / NOT FOUND per row.
+- Subset/reorder output columns via a small config list.
+- Multi-source folders (loop several workbooks).
+- Optional case-sensitive or pattern matching on IDs.
+- Timestamp + source-file note written to a log cell.
+- Progress in the status bar for very large workbooks.
+- A "Compare run vs run" diff to highlight changed trade fields.
