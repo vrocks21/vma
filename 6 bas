@@ -1,0 +1,71 @@
+Attribute VB_Name = "modDiagnose"
+Option Explicit
+
+'======================================================================
+' modDiagnose
+'----------------------------------------------------------------------
+' One-off diagnostic. Run DiagnoseSource, then read the message box.
+' It tells us whether the source has real Excel Tables, and shows the
+' EXACT header text (with any hidden spaces made visible) so we can see
+' why "Barclays Trade ID" isn't matching.
+'======================================================================
+
+Public Sub DiagnoseSource()
+    Dim src As Workbook, ws As Worksheet, lo As ListObject
+    Dim msg As String, tableCount As Long, i As Long
+    Dim shown As Long
+
+    On Error GoTo Fail
+    Set src = GetSourceWorkbook()
+
+    msg = "Source: " & src.Name & vbCrLf & _
+          "Sheets: " & src.Worksheets.Count & vbCrLf & vbCrLf
+
+    For Each ws In src.Worksheets
+        For Each lo In ws.ListObjects
+            tableCount = tableCount + 1
+            If shown < 8 Then          ' show details for the first few tables
+                shown = shown + 1
+                msg = msg & "TABLE: [" & ws.Name & "] " & lo.Name & _
+                      "  (" & lo.ListColumns.Count & " cols)" & vbCrLf
+                For i = 1 To lo.ListColumns.Count
+                    msg = msg & "   " & i & ": " & _
+                          Reveal(lo.ListColumns(i).Name) & vbCrLf
+                Next i
+                msg = msg & vbCrLf
+            End If
+        Next lo
+    Next ws
+
+    If tableCount = 0 Then
+        msg = msg & "*** NO EXCEL TABLES found on any sheet. ***" & vbCrLf & _
+              "Your data is plain ranges, not Ctrl+T Tables." & vbCrLf & _
+              "Tell me and I'll give you the range-based version."
+    Else
+        msg = msg & "Total tables: " & tableCount & vbCrLf & _
+              "Look for the Trade ID column above. Spaces/newlines are shown " & _
+              "as <sp> <nbsp> <lf>. The header must read exactly:" & vbCrLf & _
+              "'" & HEADER_SOURCE_ID & "'"
+    End If
+
+    MsgBox msg, vbInformation, "Vinzor - Source Diagnostic"
+    Exit Sub
+
+Fail:
+    MsgBox "Diagnostic stopped:" & vbCrLf & vbCrLf & Err.Description, _
+           vbCritical, "Vinzor - Source Diagnostic"
+End Sub
+
+'----------------------------------------------------------------------
+' Make invisible characters visible so we can spot why a header fails
+' to match: normal space -> <sp>, non-breaking space -> <nbsp>,
+' line feed / carriage return -> <lf> / <cr>, tab -> <tab>.
+'----------------------------------------------------------------------
+Private Function Reveal(ByVal s As String) As String
+    s = Replace(s, Chr(160), "<nbsp>")
+    s = Replace(s, vbLf, "<lf>")
+    s = Replace(s, vbCr, "<cr>")
+    s = Replace(s, vbTab, "<tab>")
+    s = Replace(s, " ", "<sp>")
+    Reveal = "[" & s & "]"
+End Function
