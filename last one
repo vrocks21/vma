@@ -1,0 +1,1071 @@
+"""app.py — Exposure & Collateral Engine (SINGLE-FILE BUILD).
+
+A complete, self-contained Streamlit app that reads two (or more) Excel
+files, validates them, runs configurable business calculations, and shows a
+formatted output table with copy / Excel / CSV export.
+
+Everything lives in this one file, organised into clearly-marked sections so
+it stays maintainable. In day-to-day use you only edit two of them:
+
+    ┌─ SECTION 1  CONFIG ............ headers, sheet names, output layout,
+    │                                 formatting, highlighting  ← EDIT HERE
+    ├─ SECTION 2  UTILS ............. logging, timing, byte helpers
+    ├─ SECTION 3  EXCEL READER ...... read workbooks / sheets
+    ├─ SECTION 4  VALIDATION ........ config-driven, friendly errors
+    ├─ SECTION 5  CALCULATIONS ...... business formulas only         ← EDIT HERE
+    ├─ SECTION 6  OUTPUT FORMATTER .. build + format the output table
+    ├─ SECTION 7  PROCESSING ........ workflow coordinator
+    ├─ SECTION 8  SAMPLE DATA ....... generate dummy test workbooks
+    └─ SECTION 9  STREAMLIT UI ...... widgets, buttons, display
+
+Run with:
+    pip install streamlit pandas numpy openpyxl
+    streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import date
+from enum import Enum
+from functools import wraps
+from typing import IO, Any, Callable, Dict, List, Optional, TypeVar, Union
+
+import numpy as np
+import pandas as pd
+from pandas.io.formats.style import Styler
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 1 · CONFIG                                                    #
+# ---- The primary place to edit. Change headers, sheet names, the ---- #
+# ---- output layout, formatting and highlighting here. --------------- #
+# ==================================================================== #
+# ==================================================================== #
+
+# --- Application settings -------------------------------------------
+APP_TITLE: str = "Exposure & Collateral Engine"
+APP_ICON: str = "📊"
+APP_DESCRIPTION: str = (
+    "Upload the trade blotter and the asset reference file, validate them, "
+    "then generate the exposure / collateral / margin report."
+)
+
+# --- Logging --------------------------------------------------------
+LOG_LEVEL: int = logging.INFO
+LOG_FORMAT: str = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+LOG_TO_FILE: bool = True
+LOG_FILE: str = "app.log"
+
+# --- Output / display ----------------------------------------------
+OUTPUT_SHEET_NAME: str = "Processed Output"
+MISSING_VALUE_DISPLAY: str = "—"
+
+
+# --- Logical column names (internal contract used across sections) --
+# Input columns (their Excel headers are defined further down).
+COL_TRADE_ID: str = "trade_id"
+COL_ASSET: str = "asset"
+COL_CURRENCY: str = "currency"
+COL_AMOUNT: str = "amount"
+COL_TRADE_DATE: str = "trade_date"
+COL_PRICE: str = "price"
+COL_HAIRCUT: str = "haircut"
+COL_FX_RATE: str = "fx_rate"
+# Calculated columns (produced in SECTION 5).
+COL_MARKET_VALUE: str = "market_value"
+COL_EXPOSURE: str = "exposure"
+COL_COLLATERAL: str = "collateral"
+COL_MARGIN: str = "margin"
+COL_CASH_REQUIREMENT: str = "cash_requirement"
+COL_WEIGHTED_AVG_PRICE: str = "weighted_average_price"
+
+
+@dataclass(frozen=True)
+class InputFileSpec:
+    """Declarative description of one input Excel file.
+
+    Attributes:
+        label: Human-friendly name shown in the UI and logs.
+        sheet_name: Worksheet to read from the uploaded workbook.
+        columns: Mapping of ``logical_name -> Excel header``.
+        required: Logical names that must be present and populated.
+        numeric: Logical names that must be coercible to numbers.
+        dates: Logical names that must be coercible to dates.
+        unique_key: Logical name that must not contain duplicates
+            (``None`` disables the check).
+        merge_on: Logical name used to join this file onto the growing
+            dataset (``None`` marks the base file — the first one).
+        merge_how: Pandas merge strategy ("left", "inner", ...).
+    """
+
+    label: str
+    sheet_name: str
+    columns: Dict[str, str]
+    required: List[str] = field(default_factory=list)
+    numeric: List[str] = field(default_factory=list)
+    dates: List[str] = field(default_factory=list)
+    unique_key: Optional[str] = None
+    merge_on: Optional[str] = None
+    merge_how: str = "left"
+
+    def header_for(self, logical: str) -> str:
+        """Return the Excel header configured for a logical name."""
+        return self.columns[logical]
+
+    def logical_by_header(self) -> Dict[str, str]:
+        """Return the inverse mapping ``Excel header -> logical name``."""
+        return {header: logical for logical, header in self.columns.items()}
+
+
+class ColumnType(str, Enum):
+    """How an output column obtains its value."""
+
+    DIRECT = "direct"            # copied straight from an input column
+    CALCULATED = "calculated"    # produced by a calculation (SECTION 5)
+    CONSTANT = "constant"        # a fixed literal value for every row
+    BLANK = "blank"             # intentionally empty column
+    CONDITIONAL = "conditional"  # value derived per-row by a callable
+
+
+@dataclass(frozen=True)
+class OutputColumn:
+    """One column in the final output table.
+
+    Attributes:
+        name: The header shown to the user in the output table.
+        kind: A :class:`ColumnType` describing how the value is derived.
+        source: Logical column name (for DIRECT / CALCULATED columns).
+        value: Literal value (for CONSTANT columns).
+        condition: ``callable(row) -> value`` (for CONDITIONAL columns).
+    """
+
+    name: str
+    kind: ColumnType
+    source: Optional[str] = None
+    value: Any = None
+    condition: Optional[Callable[[pd.Series], Any]] = None
+
+
+# --------------------------------------------------------------------
+# ####################  INPUT FILE DEFINITIONS  ######################
+# Change EXCEL HEADERS (right-hand side) and SHEET NAMES here.
+# To add a third file, append a new InputFileSpec to INPUT_FILES.
+# --------------------------------------------------------------------
+FILE_1 = InputFileSpec(
+    label="Trade Blotter",
+    sheet_name="Trades",
+    columns={
+        COL_TRADE_ID: "Trade ID",
+        COL_ASSET: "Asset",
+        COL_CURRENCY: "Currency",
+        COL_AMOUNT: "Amount",
+        COL_TRADE_DATE: "Trade Date",
+    },
+    required=[COL_TRADE_ID, COL_ASSET, COL_AMOUNT],
+    numeric=[COL_AMOUNT],
+    dates=[COL_TRADE_DATE],
+    unique_key=COL_TRADE_ID,
+    merge_on=None,          # base dataset
+    merge_how="left",
+)
+
+FILE_2 = InputFileSpec(
+    label="Asset Reference Data",
+    sheet_name="Reference",
+    columns={
+        COL_ASSET: "Asset",
+        COL_PRICE: "Price",
+        COL_HAIRCUT: "Haircut",
+        COL_FX_RATE: "FX Rate",
+    },
+    required=[COL_ASSET, COL_PRICE, COL_HAIRCUT, COL_FX_RATE],
+    numeric=[COL_PRICE, COL_HAIRCUT, COL_FX_RATE],
+    dates=[],
+    unique_key=COL_ASSET,
+    merge_on=COL_ASSET,     # joined onto the base by asset
+    merge_how="left",
+)
+
+#: Ordered list of input files. Append here to add a third file.
+INPUT_FILES: List[InputFileSpec] = [FILE_1, FILE_2]
+
+
+# --------------------------------------------------------------------
+# ####################  COLUMN MAPPING (OUTPUT)  #####################
+# The output table is built row-for-row from this list, in order.
+#   DIRECT      -> copy an input column        (Trade ID  -> "Trade")
+#   CALCULATED  -> use a calculation result    (exposure  -> "Exposure")
+#   CONSTANT    -> a fixed value for all rows   (            "Report Ccy")
+#   BLANK       -> an intentionally empty column (           "Remarks")
+#   CONDITIONAL -> a per-row callable            (           "Status")
+# --------------------------------------------------------------------
+def _status_rule(row: pd.Series) -> str:
+    """Bucket a row by exposure size (example CONDITIONAL column)."""
+    exposure = row.get(COL_EXPOSURE)
+    if exposure is None or pd.isna(exposure):
+        return "N/A"
+    return "High" if exposure >= 5_000_000 else "Normal"
+
+
+OUTPUT_COLUMNS: List[OutputColumn] = [
+    OutputColumn("Trade", ColumnType.DIRECT, source=COL_TRADE_ID),
+    OutputColumn("Security", ColumnType.DIRECT, source=COL_ASSET),
+    OutputColumn("Currency", ColumnType.DIRECT, source=COL_CURRENCY),
+    OutputColumn("Trade Date", ColumnType.DIRECT, source=COL_TRADE_DATE),
+    OutputColumn("Nominal", ColumnType.DIRECT, source=COL_AMOUNT),
+    OutputColumn("Current Price", ColumnType.DIRECT, source=COL_PRICE),
+    OutputColumn("FX Rate", ColumnType.DIRECT, source=COL_FX_RATE),
+    OutputColumn("Market Value", ColumnType.CALCULATED, source=COL_MARKET_VALUE),
+    OutputColumn("Exposure", ColumnType.CALCULATED, source=COL_EXPOSURE),
+    OutputColumn("Haircut", ColumnType.DIRECT, source=COL_HAIRCUT),
+    OutputColumn("Collateral", ColumnType.CALCULATED, source=COL_COLLATERAL),
+    OutputColumn("Margin", ColumnType.CALCULATED, source=COL_MARGIN),
+    OutputColumn("Cash Requirement", ColumnType.CALCULATED, source=COL_CASH_REQUIREMENT),
+    OutputColumn("Report Ccy", ColumnType.CONSTANT, value="USD"),
+    OutputColumn("Status", ColumnType.CONDITIONAL, condition=_status_rule),
+    OutputColumn("Remarks", ColumnType.BLANK),
+]
+
+
+# --------------------------------------------------------------------
+# ####################  FORMATTING RULES  ############################
+# Keyed by OUTPUT header. kind ∈ {number, currency, percent, date}.
+# "negative": "parentheses" renders -1,234 as (1,234).
+# --------------------------------------------------------------------
+COLUMN_FORMATS: Dict[str, Dict[str, Any]] = {
+    "Nominal": {"kind": "number", "decimals": 0, "thousands": True},
+    "Current Price": {"kind": "number", "decimals": 4, "thousands": True},
+    "FX Rate": {"kind": "number", "decimals": 4, "thousands": False},
+    "Market Value": {"kind": "currency", "symbol": "$", "decimals": 2, "thousands": True},
+    "Exposure": {"kind": "currency", "symbol": "$", "decimals": 2, "thousands": True},
+    "Haircut": {"kind": "percent", "decimals": 2},
+    "Collateral": {"kind": "currency", "symbol": "$", "decimals": 2, "thousands": True},
+    "Margin": {
+        "kind": "currency", "symbol": "$", "decimals": 2,
+        "thousands": True, "negative": "parentheses",
+    },
+    "Cash Requirement": {"kind": "currency", "symbol": "$", "decimals": 2, "thousands": True},
+    "Trade Date": {"kind": "date", "format": "%Y-%m-%d"},
+}
+
+
+# --------------------------------------------------------------------
+# ####################  CONDITIONAL HIGHLIGHTING  ####################
+# Each rule: output column, predicate over the RAW value, and CSS.
+# --------------------------------------------------------------------
+HIGHLIGHT_RULES: List[Dict[str, Any]] = [
+    {
+        "column": "Margin",
+        "when": lambda v: pd.notna(v) and v < 0,
+        "style": "color: #b00020; font-weight: 600;",
+    },
+    {
+        "column": "Status",
+        "when": lambda v: v == "High",
+        "style": "background-color: #fde68a;",
+    },
+]
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 2 · UTILS  (logging, timing, byte/TSV helpers)               #
+# ==================================================================== #
+# ==================================================================== #
+_LOGGER_NAME = "excel_app"
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def get_logger(name: str = _LOGGER_NAME) -> logging.Logger:
+    """Return a process-wide singleton logger (console + optional file)."""
+    logger_ = logging.getLogger(name)
+    if logger_.handlers:
+        return logger_
+
+    logger_.setLevel(LOG_LEVEL)
+    formatter = logging.Formatter(LOG_FORMAT)
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    logger_.addHandler(console)
+
+    if LOG_TO_FILE:
+        try:
+            file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            logger_.addHandler(file_handler)
+        except OSError:
+            pass  # read-only filesystem (e.g. some hosts): console only
+
+    logger_.propagate = False
+    return logger_
+
+
+logger = get_logger()
+
+
+def timed(label: str | None = None) -> Callable[[_F], _F]:
+    """Decorator that logs the wall-clock execution time of a function."""
+
+    def decorator(func: _F) -> _F:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            name = label or func.__name__
+            start = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                logger.info("⏱  %s finished in %.3fs", name, time.perf_counter() - start)
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Output") -> bytes:
+    """Serialise a DataFrame to in-memory ``.xlsx`` bytes (types preserved)."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Serialise a DataFrame to UTF-8 CSV bytes."""
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def dataframe_to_tsv(df: pd.DataFrame) -> str:
+    """Serialise a DataFrame to tab-separated text (for clipboard copy)."""
+    return df.to_csv(index=False, sep="\t")
+
+
+def friendly_error(exc: Exception) -> str:
+    """Turn an exception into a short, user-readable one-line message."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 3 · EXCEL READER                                             #
+# ==================================================================== #
+# ==================================================================== #
+WorkbookSource = Union[str, IO[bytes]]
+
+
+class ExcelReadError(Exception):
+    """Raised when a workbook cannot be opened or parsed."""
+
+
+class SheetNotFoundError(ExcelReadError):
+    """Raised when a requested worksheet does not exist in the workbook."""
+
+
+class ExcelReader:
+    """Read worksheets from a single Excel workbook.
+
+    Example:
+        >>> df = ExcelReader(uploaded_file).read_sheet("Trades")
+    """
+
+    def __init__(self, source: WorkbookSource, engine: str = "openpyxl") -> None:
+        """Initialise the reader with a path or binary file-like object."""
+        self._source = source
+        self._engine = engine
+        self._sheet_names: List[str] | None = None
+
+    def sheet_names(self) -> List[str]:
+        """Return (and cache) the workbook's worksheet names."""
+        if self._sheet_names is None:
+            try:
+                self._rewind()
+                with pd.ExcelFile(self._source, engine=self._engine) as xls:
+                    self._sheet_names = list(xls.sheet_names)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to open workbook: %s", exc)
+                raise ExcelReadError(
+                    "The uploaded file could not be opened as an Excel "
+                    "workbook. Please check it is a valid .xlsx file."
+                ) from exc
+        return self._sheet_names
+
+    def has_sheet(self, sheet_name: str) -> bool:
+        """Return ``True`` if ``sheet_name`` exists in the workbook."""
+        return sheet_name in self.sheet_names()
+
+    def read_sheet(self, sheet_name: str) -> pd.DataFrame:
+        """Read one worksheet into a DataFrame (headers stripped of spaces)."""
+        if not self.has_sheet(sheet_name):
+            available = ", ".join(self.sheet_names()) or "(none)"
+            raise SheetNotFoundError(
+                f"Sheet '{sheet_name}' was not found. Available sheets: {available}."
+            )
+        try:
+            self._rewind()
+            df = pd.read_excel(self._source, sheet_name=sheet_name, engine=self._engine)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to read sheet '%s': %s", sheet_name, exc)
+            raise ExcelReadError(f"Sheet '{sheet_name}' could not be read: {exc}") from exc
+
+        logger.info("Read sheet '%s' (%d rows x %d cols)", sheet_name, *df.shape)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
+    def read_sheets(self, sheet_names: List[str]) -> Dict[str, pd.DataFrame]:
+        """Read several worksheets, returning ``{sheet_name: DataFrame}``."""
+        return {name: self.read_sheet(name) for name in sheet_names}
+
+    def _rewind(self) -> None:
+        """Rewind a file-like source so it can be read more than once."""
+        seek = getattr(self._source, "seek", None)
+        if callable(seek):
+            try:
+                seek(0)
+            except (OSError, ValueError):
+                pass
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 4 · VALIDATION  (config-driven; never raises for data)       #
+# ==================================================================== #
+# ==================================================================== #
+@dataclass
+class ValidationIssue:
+    """A single validation finding (``severity`` is 'error' or 'warning')."""
+
+    severity: str
+    message: str
+
+
+@dataclass
+class ValidationReport:
+    """The collected result of validating one file."""
+
+    file_label: str
+    issues: List[ValidationIssue] = field(default_factory=list)
+
+    def add_error(self, message: str) -> None:
+        """Record a blocking error."""
+        self.issues.append(ValidationIssue("error", message))
+
+    def add_warning(self, message: str) -> None:
+        """Record a non-blocking warning."""
+        self.issues.append(ValidationIssue("warning", message))
+
+    @property
+    def errors(self) -> List[str]:
+        """All blocking error messages."""
+        return [i.message for i in self.issues if i.severity == "error"]
+
+    @property
+    def warnings(self) -> List[str]:
+        """All non-blocking warning messages."""
+        return [i.message for i in self.issues if i.severity == "warning"]
+
+    @property
+    def is_valid(self) -> bool:
+        """``True`` when there are no blocking errors."""
+        return not self.errors
+
+
+class Validator:
+    """Validate a DataFrame against an :class:`InputFileSpec`."""
+
+    #: If fewer than this fraction of expected headers are present, assume
+    #: the wrong file was uploaded and skip the remaining checks.
+    WRONG_FILE_THRESHOLD: float = 0.5
+
+    def validate(self, df: pd.DataFrame, spec: InputFileSpec) -> ValidationReport:
+        """Run every configured check and return a :class:`ValidationReport`."""
+        report = ValidationReport(file_label=spec.label)
+
+        if df is None or df.empty:
+            report.add_error(f"'{spec.label}' contains no rows of data.")
+            return report
+
+        expected_headers = set(spec.columns.values())
+        present_headers = expected_headers & set(df.columns)
+        coverage = len(present_headers) / max(len(expected_headers), 1)
+        if coverage < self.WRONG_FILE_THRESHOLD:
+            report.add_error(
+                f"This does not look like the '{spec.label}' file. "
+                f"Expected columns like: {', '.join(sorted(expected_headers))}."
+            )
+            return report
+
+        self._check_required_columns(df, spec, report)
+        self._check_empty_values(df, spec, report)
+        self._check_numeric(df, spec, report)
+        self._check_dates(df, spec, report)
+        self._check_duplicates(df, spec, report)
+
+        logger.info(
+            "Validation of '%s': %d error(s), %d warning(s)",
+            spec.label, len(report.errors), len(report.warnings),
+        )
+        return report
+
+    def _check_required_columns(self, df, spec, report) -> None:
+        """Flag any required column whose Excel header is absent."""
+        for logical in spec.required:
+            header = spec.header_for(logical)
+            if header not in df.columns:
+                report.add_error(f"'{spec.label}': required column '{header}' is missing.")
+
+    def _check_empty_values(self, df, spec, report) -> None:
+        """Flag blank cells in required columns."""
+        for logical in spec.required:
+            header = spec.header_for(logical)
+            if header not in df.columns:
+                continue
+            blank = int(df[header].isna().sum())
+            if blank:
+                report.add_error(
+                    f"'{spec.label}': column '{header}' has {blank} empty value(s)."
+                )
+
+    def _check_numeric(self, df, spec, report) -> None:
+        """Flag non-numeric entries in numeric columns."""
+        for logical in spec.numeric:
+            header = spec.header_for(logical)
+            if header not in df.columns:
+                continue
+            coerced = pd.to_numeric(df[header], errors="coerce")
+            bad = coerced.isna() & df[header].notna()
+            if bad.any():
+                rows = (bad[bad].index + 2).tolist()
+                preview = ", ".join(map(str, rows[:5]))
+                report.add_error(
+                    f"'{spec.label}': column '{header}' has non-numeric value(s) "
+                    f"at row(s) {preview}" + ("…" if len(rows) > 5 else "")
+                )
+
+    def _check_dates(self, df, spec, report) -> None:
+        """Flag unparseable entries in date columns (as warnings)."""
+        for logical in spec.dates:
+            header = spec.header_for(logical)
+            if header not in df.columns:
+                continue
+            coerced = pd.to_datetime(df[header], errors="coerce")
+            bad = coerced.isna() & df[header].notna()
+            if bad.any():
+                rows = (bad[bad].index + 2).tolist()
+                preview = ", ".join(map(str, rows[:5]))
+                report.add_warning(
+                    f"'{spec.label}': column '{header}' has unrecognised date(s) "
+                    f"at row(s) {preview}" + ("…" if len(rows) > 5 else "")
+                )
+
+    def _check_duplicates(self, df, spec, report) -> None:
+        """Flag duplicate values in the configured unique-key column."""
+        if spec.unique_key is None:
+            return
+        header = spec.header_for(spec.unique_key)
+        if header not in df.columns:
+            return
+        dup_mask = df[header].duplicated(keep=False)
+        if dup_mask.any():
+            dups = df.loc[dup_mask, header].dropna().unique().tolist()
+            preview = ", ".join(map(str, dups[:5]))
+            report.add_error(
+                f"'{spec.label}': duplicate '{header}' value(s): {preview}"
+                + ("…" if len(dups) > 5 else "")
+            )
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 5 · CALCULATIONS                                             #
+# ==================================================================== #
+# ##############################################################       #
+# ####################  CUSTOM BUSINESS LOGIC  ################       #
+# ##############################################################       #
+# The ONLY place business formulas live. Each function is tiny,       #
+# pure and vectorised; `df` is keyed by the logical names above.      #
+# ==================================================================== #
+def calculate_market_value(df: pd.DataFrame) -> pd.Series:
+    """market_value = amount * price."""
+    return df[COL_AMOUNT] * df[COL_PRICE]
+
+
+def calculate_fx(df: pd.DataFrame) -> pd.Series:
+    """fx_value = market_value * fx_rate (reporting-currency conversion)."""
+    return calculate_market_value(df) * df[COL_FX_RATE]
+
+
+def calculate_exposure(df: pd.DataFrame) -> pd.Series:
+    """exposure = amount * price * fx_rate."""
+    return df[COL_AMOUNT] * df[COL_PRICE] * df[COL_FX_RATE]
+
+
+def calculate_haircut(df: pd.DataFrame) -> pd.Series:
+    """haircut_amount = exposure * haircut."""
+    return calculate_exposure(df) * df[COL_HAIRCUT]
+
+
+def calculate_collateral(df: pd.DataFrame) -> pd.Series:
+    """collateral = exposure * (1 - haircut)."""
+    return calculate_exposure(df) * (1.0 - df[COL_HAIRCUT])
+
+
+def calculate_margin(df: pd.DataFrame) -> pd.Series:
+    """margin = collateral - exposure (negative == under-collateralised)."""
+    return calculate_collateral(df) - calculate_exposure(df)
+
+
+def calculate_cash_requirement(df: pd.DataFrame) -> pd.Series:
+    """cash_requirement = exposure - collateral."""
+    return calculate_exposure(df) - calculate_collateral(df)
+
+
+def calculate_weighted_average(df: pd.DataFrame) -> pd.Series:
+    """Amount-weighted average price per asset: Σ(amount*price)/Σ(amount)."""
+    weighted_values = df[COL_AMOUNT] * df[COL_PRICE]
+    group = df[COL_ASSET]
+    numerator = weighted_values.groupby(group).transform("sum")
+    denominator = df[COL_AMOUNT].groupby(group).transform("sum")
+    return numerator / denominator.replace(0, np.nan)
+
+
+# CALCULATION PIPELINE — add a (logical_name, function) line to add a formula.
+CALCULATION_PIPELINE: List[tuple] = [
+    (COL_MARKET_VALUE, calculate_market_value),
+    (COL_EXPOSURE, calculate_exposure),
+    (COL_COLLATERAL, calculate_collateral),
+    (COL_MARGIN, calculate_margin),
+    (COL_CASH_REQUIREMENT, calculate_cash_requirement),
+    (COL_WEIGHTED_AVG_PRICE, calculate_weighted_average),
+]
+# ##############################################################       #
+# ##################  END CUSTOM BUSINESS LOGIC  #############       #
+# ##############################################################       #
+
+
+@timed("calculations")
+def run_calculations(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply every registered calculation, returning a new DataFrame."""
+    result = df.copy()
+    for column_name, func in CALCULATION_PIPELINE:
+        logger.info("Calculating '%s'", column_name)
+        result[column_name] = func(result)
+    return result
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 6 · OUTPUT FORMATTER                                         #
+# ==================================================================== #
+# ==================================================================== #
+def assemble_output(df: pd.DataFrame) -> pd.DataFrame:
+    """Build the final output table from ``OUTPUT_COLUMNS`` (native types)."""
+    columns: Dict[str, Any] = {spec.name: _build_column(df, spec) for spec in OUTPUT_COLUMNS}
+    output = pd.DataFrame(columns, index=df.index)
+    logger.info("Assembled output table (%d rows x %d cols)", *output.shape)
+    return output.reset_index(drop=True)
+
+
+def _build_column(df: pd.DataFrame, spec: OutputColumn) -> pd.Series:
+    """Return the Series for one output column according to its type."""
+    if spec.kind in (ColumnType.DIRECT, ColumnType.CALCULATED):
+        if spec.source in df.columns:
+            return df[spec.source]
+        logger.warning("Output source '%s' not found; filling NA", spec.source)
+        return pd.Series(pd.NA, index=df.index)
+    if spec.kind is ColumnType.CONSTANT:
+        return pd.Series(spec.value, index=df.index)
+    if spec.kind is ColumnType.BLANK:
+        return pd.Series(pd.NA, index=df.index)
+    if spec.kind is ColumnType.CONDITIONAL:
+        assert spec.condition is not None, "CONDITIONAL column needs a callable"
+        return df.apply(spec.condition, axis=1)
+    raise ValueError(f"Unknown column type: {spec.kind}")  # pragma: no cover
+
+
+def build_display_styler(raw: pd.DataFrame) -> Styler:
+    """Wrap the raw output in a Styler (formatting + highlighting)."""
+    formatters = {
+        column: _make_formatter(rule)
+        for column, rule in COLUMN_FORMATS.items()
+        if column in raw.columns
+    }
+    styler = raw.style.format(formatter=formatters, na_rep=MISSING_VALUE_DISPLAY)
+    return _apply_highlighting(styler, raw)
+
+
+def _make_formatter(rule: Dict[str, Any]) -> Callable[[Any], str]:
+    """Return a value->string formatter for one COLUMN_FORMATS rule."""
+    kind = rule.get("kind", "number")
+
+    def fmt(value: Any) -> str:
+        if value is None or value is pd.NA or (isinstance(value, float) and pd.isna(value)):
+            return MISSING_VALUE_DISPLAY
+        try:
+            if kind == "date":
+                return pd.to_datetime(value).strftime(rule.get("format", "%Y-%m-%d"))
+            if kind == "percent":
+                return f"{value * 100:,.{rule.get('decimals', 2)}f}%"
+
+            number = float(value)
+            decimals = rule.get("decimals", 2)
+            grouping = "," if rule.get("thousands", False) else ""
+            body = f"{abs(number):{grouping}.{decimals}f}"
+            symbol = rule.get("symbol", "") if kind == "currency" else ""
+
+            if number < 0 and rule.get("negative") == "parentheses":
+                return f"({symbol}{body})"
+            sign = "-" if number < 0 else ""
+            return f"{sign}{symbol}{body}"
+        except (ValueError, TypeError):
+            return str(value)
+
+    return fmt
+
+
+def _apply_highlighting(styler: Styler, raw: pd.DataFrame) -> Styler:
+    """Apply every rule in ``HIGHLIGHT_RULES`` to the Styler."""
+    for rule in HIGHLIGHT_RULES:
+        column = rule["column"]
+        if column not in raw.columns:
+            continue
+        predicate: Callable[[Any], bool] = rule["when"]
+        css: str = rule["style"]
+
+        def _style(value: Any, _pred=predicate, _css=css) -> str:
+            try:
+                return _css if _pred(value) else ""
+            except (ValueError, TypeError):
+                return ""
+
+        styler = styler.map(_style, subset=[column])
+    return styler
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 7 · PROCESSING  (workflow coordinator, no business rules)    #
+# ==================================================================== #
+# ==================================================================== #
+@dataclass
+class ProcessingResult:
+    """Outcome of a full processing run."""
+
+    success: bool
+    output: Optional[pd.DataFrame] = None
+    reports: List[ValidationReport] = field(default_factory=list)
+    message: str = ""
+    elapsed: float = 0.0
+
+
+class DataProcessor:
+    """Coordinate reading, validating, merging and calculating."""
+
+    def __init__(self, specs: Optional[List[InputFileSpec]] = None) -> None:
+        self.specs = specs if specs is not None else INPUT_FILES
+        self.validator = Validator()
+
+    def validate(self, sources: Dict[str, WorkbookSource]) -> List[ValidationReport]:
+        """Read and validate every file without running calculations."""
+        reports: List[ValidationReport] = []
+        for spec in self.specs:
+            report = ValidationReport(file_label=spec.label)
+            try:
+                df = self._read(spec, sources.get(spec.label))
+                report = self.validator.validate(df, spec)
+            except (ExcelReadError, ValueError) as exc:
+                report.add_error(friendly_error(exc))
+            reports.append(report)
+        return reports
+
+    def run(self, sources: Dict[str, WorkbookSource]) -> ProcessingResult:
+        """Execute the full pipeline, capturing timing and errors."""
+        start = time.perf_counter()
+        try:
+            frames = {s.label: self._read(s, sources.get(s.label)) for s in self.specs}
+
+            reports = [self.validator.validate(frames[s.label], s) for s in self.specs]
+            if any(not r.is_valid for r in reports):
+                return ProcessingResult(
+                    success=False, reports=reports,
+                    message="Validation failed — please fix the issues above.",
+                    elapsed=time.perf_counter() - start,
+                )
+
+            prepared = {s.label: self._prepare(frames[s.label], s) for s in self.specs}
+            merged = self._merge(prepared)
+            enriched = run_calculations(merged)
+            output = assemble_output(enriched)
+
+            elapsed = time.perf_counter() - start
+            logger.info("Pipeline complete in %.3fs", elapsed)
+            return ProcessingResult(
+                success=True, output=output, reports=reports,
+                message=f"Processed {len(output)} row(s) successfully.", elapsed=elapsed,
+            )
+        except Exception as exc:  # noqa: BLE001 - top-level safety net
+            logger.exception("Pipeline failed")
+            return ProcessingResult(
+                success=False, message=f"Processing error: {friendly_error(exc)}",
+                elapsed=time.perf_counter() - start,
+            )
+
+    def _read(self, spec: InputFileSpec, source: Optional[WorkbookSource]) -> pd.DataFrame:
+        """Read the configured sheet for one spec."""
+        if source is None:
+            raise ValueError(f"No file was provided for '{spec.label}'.")
+        return ExcelReader(source).read_sheet(spec.sheet_name)
+
+    def _prepare(self, df: pd.DataFrame, spec: InputFileSpec) -> pd.DataFrame:
+        """Rename headers to logical names and coerce numeric/date types."""
+        rename_map = spec.logical_by_header()
+        keep = [h for h in spec.columns.values() if h in df.columns]
+        prepared = df[keep].rename(columns=rename_map).copy()
+        for logical in spec.numeric:
+            if logical in prepared.columns:
+                prepared[logical] = pd.to_numeric(prepared[logical], errors="coerce")
+        for logical in spec.dates:
+            if logical in prepared.columns:
+                prepared[logical] = pd.to_datetime(prepared[logical], errors="coerce")
+        return prepared
+
+    def _merge(self, prepared: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """Merge all prepared frames into one, following config order."""
+        merged: Optional[pd.DataFrame] = None
+        for spec in self.specs:
+            frame = prepared[spec.label]
+            if merged is None:
+                merged = frame
+                continue
+            merged = merged.merge(frame, on=spec.merge_on, how=spec.merge_how)
+            logger.info("Merged '%s' on '%s' (%d rows)", spec.label, spec.merge_on, len(merged))
+        assert merged is not None, "No input files configured"
+        return merged
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 8 · SAMPLE DATA  (dummy test workbooks, generated in-app)    #
+# ==================================================================== #
+# ==================================================================== #
+def build_sample_trade_blotter() -> pd.DataFrame:
+    """Return a dummy trade blotter matching ``FILE_1`` headers."""
+    c = FILE_1.columns
+    return pd.DataFrame(
+        {
+            c[COL_TRADE_ID]: [f"TR-{i:04d}" for i in range(1, 9)],
+            c[COL_ASSET]: ["US10Y", "BUND", "GILT", "US10Y", "OAT", "BTP", "BUND", "JGB"],
+            c[COL_CURRENCY]: ["USD", "EUR", "GBP", "USD", "EUR", "EUR", "EUR", "JPY"],
+            c[COL_AMOUNT]: [1_000_000, 2_500_000, 750_000, 3_200_000,
+                            1_800_000, 900_000, 1_250_000, 5_000_000],
+            c[COL_TRADE_DATE]: [
+                date(2025, 1, 6), date(2025, 1, 7), date(2025, 1, 7), date(2025, 1, 8),
+                date(2025, 1, 8), date(2025, 1, 9), date(2025, 1, 9), date(2025, 1, 10),
+            ],
+        }
+    )
+
+
+def build_sample_asset_reference() -> pd.DataFrame:
+    """Return dummy asset reference data matching ``FILE_2`` headers."""
+    c = FILE_2.columns
+    return pd.DataFrame(
+        {
+            c[COL_ASSET]: ["US10Y", "BUND", "GILT", "OAT", "BTP", "JGB"],
+            c[COL_PRICE]: [98.45, 101.20, 97.80, 100.15, 95.60, 99.90],
+            c[COL_HAIRCUT]: [0.02, 0.02, 0.03, 0.025, 0.05, 0.02],
+            c[COL_FX_RATE]: [1.00, 1.08, 1.27, 1.08, 1.08, 0.0064],
+        }
+    )
+
+
+# ==================================================================== #
+# ==================================================================== #
+# SECTION 9 · STREAMLIT UI  (widgets/buttons/display only)             #
+# ==================================================================== #
+# ==================================================================== #
+KEY_RESULT = "processing_result"
+KEY_REPORTS = "validation_reports"
+
+
+def _render_header() -> None:
+    """Render the title, icon, instructions and sample-file downloads."""
+    st.set_page_config(page_title=APP_TITLE, page_icon=APP_ICON, layout="wide")
+    st.title(f"{APP_ICON} {APP_TITLE}")
+    st.caption(APP_DESCRIPTION)
+
+    with st.expander("ℹ️  How to use / get sample files", expanded=False):
+        st.markdown(
+            "1. Upload each Excel file into its slot.\n"
+            "2. Click **Validate**, then **Process**.\n"
+            "3. **Copy**, or download the result as Excel or CSV.\n\n"
+            "No files handy? Download these ready-made samples and upload them:"
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "⬇️ Sample: Trade Blotter",
+                data=dataframe_to_excel_bytes(build_sample_trade_blotter(), FILE_1.sheet_name),
+                file_name="input_file_1.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with col2:
+            st.download_button(
+                "⬇️ Sample: Asset Reference",
+                data=dataframe_to_excel_bytes(build_sample_asset_reference(), FILE_2.sheet_name),
+                file_name="input_file_2.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+
+def _render_uploaders() -> Dict[str, Optional[object]]:
+    """Render one uploader per configured input file."""
+    st.subheader("1 · Upload files")
+    sources: Dict[str, Optional[object]] = {}
+    columns = st.columns(len(INPUT_FILES))
+    for spec, column in zip(INPUT_FILES, columns):
+        with column:
+            sources[spec.label] = st.file_uploader(
+                f"**{spec.label}**  ·  sheet: `{spec.sheet_name}`",
+                type=["xlsx", "xls"], key=f"upload_{spec.label}",
+            )
+    return sources
+
+
+def _all_uploaded(sources: Dict[str, Optional[object]]) -> bool:
+    """Return ``True`` only if every configured file has been provided."""
+    return all(sources.get(spec.label) is not None for spec in INPUT_FILES)
+
+
+def _render_reports(reports: List[ValidationReport]) -> None:
+    """Display validation errors and warnings in a friendly way."""
+    for report in reports:
+        if report.is_valid and not report.warnings:
+            st.success(f"✅ '{report.file_label}' passed validation.")
+            continue
+        for message in report.errors:
+            st.error(f"❌ {message}")
+        for message in report.warnings:
+            st.warning(f"⚠️ {message}")
+
+
+def _render_copy_button(df: pd.DataFrame) -> None:
+    """Render a 'Copy table' button that copies TSV to the clipboard."""
+    payload = json.dumps(dataframe_to_tsv(df))
+    components.html(
+        f"""
+        <button id="copy-btn" style="padding:0.5rem 1rem;border:1px solid #ccc;
+            border-radius:0.5rem;background:#f6f6f6;cursor:pointer;font-size:0.9rem;">
+            📋 Copy table
+        </button>
+        <span id="copy-msg" style="margin-left:0.6rem;color:#0a7d33;"></span>
+        <script>
+            const data = {payload};
+            document.getElementById("copy-btn").addEventListener("click", async () => {{
+                try {{
+                    await navigator.clipboard.writeText(data);
+                    document.getElementById("copy-msg").textContent = "Copied!";
+                }} catch (e) {{
+                    document.getElementById("copy-msg").textContent = "Copy failed";
+                }}
+            }});
+        </script>
+        """,
+        height=48,
+    )
+
+
+def _render_output(result: ProcessingResult) -> None:
+    """Render the output table plus copy/download controls."""
+    if result.output is None:
+        return
+    st.subheader("3 · Output")
+    st.success(f"{result.message}  (in {result.elapsed:.2f}s)")
+
+    st.dataframe(build_display_styler(result.output), use_container_width=True, hide_index=True)
+    _render_copy_button(result.output)
+
+    excel_bytes = dataframe_to_excel_bytes(result.output, OUTPUT_SHEET_NAME)
+    csv_bytes = dataframe_to_csv_bytes(result.output)
+    col_xlsx, col_csv = st.columns(2)
+    with col_xlsx:
+        st.download_button(
+            "⬇️  Download Excel", data=excel_bytes, file_name="output.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col_csv:
+        st.download_button(
+            "⬇️  Download CSV", data=csv_bytes, file_name="output.csv",
+            mime="text/csv", use_container_width=True,
+        )
+
+
+def _handle_validate(sources: Dict[str, Optional[object]]) -> None:
+    """Run validation only and store the reports."""
+    with st.spinner("Validating files…"):
+        reports = DataProcessor().validate(sources)  # type: ignore[arg-type]
+    st.session_state[KEY_REPORTS] = reports
+    st.session_state.pop(KEY_RESULT, None)
+
+
+def _handle_process(sources: Dict[str, Optional[object]]) -> None:
+    """Run the full pipeline and store the result."""
+    with st.spinner("Processing…"):
+        result = DataProcessor().run(sources)  # type: ignore[arg-type]
+    st.session_state[KEY_RESULT] = result
+    st.session_state[KEY_REPORTS] = result.reports
+
+
+def _handle_reset() -> None:
+    """Clear all app state and uploaders."""
+    st.session_state.clear()
+    st.rerun()
+
+
+def main() -> None:
+    """Compose and run the Streamlit page."""
+    _render_header()
+    sources = _render_uploaders()
+
+    st.subheader("2 · Actions")
+    ready = _all_uploaded(sources)
+    if not ready:
+        st.info("Upload every file to enable validation and processing.")
+
+    col_validate, col_process, col_reset = st.columns(3)
+    with col_validate:
+        if st.button("🔍 Validate", disabled=not ready, use_container_width=True):
+            _handle_validate(sources)
+    with col_process:
+        if st.button("⚙️ Process", type="primary", disabled=not ready, use_container_width=True):
+            _handle_process(sources)
+    with col_reset:
+        if st.button("♻️ Reset", use_container_width=True):
+            _handle_reset()
+
+    reports = st.session_state.get(KEY_REPORTS)
+    if reports:
+        st.markdown("#### Validation")
+        _render_reports(reports)
+
+    result: Optional[ProcessingResult] = st.session_state.get(KEY_RESULT)
+    if result and result.success:
+        _render_output(result)
+    elif result and not result.success and not reports:
+        st.error(result.message)
+
+
+if __name__ == "__main__":
+    main()
